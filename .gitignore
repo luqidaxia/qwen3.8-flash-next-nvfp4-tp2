@@ -1,0 +1,12 @@
+# 本地/敏感文件
+.env
+*.log
+logs/
+.last_head_launch.sh
+__pycache__/
+*.pyc
+
+# 权重与缓存
+hub/
+corpus.jsonl
+draft_vocab.txt
