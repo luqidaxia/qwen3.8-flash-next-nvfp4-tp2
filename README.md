@@ -18,7 +18,8 @@ runbook for it, plus the exact scripts the platform calls.
 | Weights | `/data/models/Mia-AiLab/Qwen3.8-Flash-Next-NVFP4` |
 
 > 中文文档见下半部分。完整部署手册见 [`deploy/README.md`](deploy/README.md)，
-> 参数逐条解释见 [`vllm-args.md`](vllm-args.md)，踩坑排查见 [`troubleshooting.md`](troubleshooting.md)。
+> 参数逐条解释见 [`vllm-args.md`](vllm-args.md)，踩坑排查见 [`troubleshooting.md`](troubleshooting.md)，
+> 并发压测结果见 [`results/`](results/)。
 
 ---
 
@@ -72,6 +73,7 @@ qwen3.8-flash-next-nvfp4-tp2/
 ├── stop-official.sh       # 停止双机容器
 ├── files/                 # 容器内即时生效的补丁与工具（无需重建镜像）
 ├── bench/                 # 压测 / 上下文 / MTP 接受率 / 推理抽检
+├── results/               # 压测结果快照（Markdown）
 ├── docs/                  # 设计与移交笔记
 └── tp1/                   # 单卡自包含子目录
 ```
@@ -161,6 +163,30 @@ docker logs vllm-fn 2>&1 | grep -E "rank .* nranks"     # expected: rank 0/1, nr
 | Sensitivity | +0.01 GMU ≈ +0.83 GiB ≈ +95k fp8 cache tokens |
 | MTP | `MTP_NUM_SPECULATIVE_TOKENS=3` |
 | Reasoning / needle regression (fp8 KV) | 12/12 both |
+
+### Benchmark: concurrency sweep (measured)
+
+Raw data: [`results/RESULTS-2026-09-21-concurrency.md`](results/RESULTS-2026-09-21-concurrency.md).
+
+Measured **2026-09-21** on the live instance (fp8 KV, MTP=3, `--max-num-seqs 8`), one round per
+level; each level starts `concurrency` workers, each sending one **random** question over SSE:
+
+| Concurrency | Requests | OK / Failed | Total tokens | Session (s) | Per-stream (tok/s) | Aggregate (tok/s) |
+|---|---|---|---|---|---|---|
+| 1 | 1 | 1 / 0 | 3,164 | 46 | 73.05 | **73.05** |
+| 2 | 2 | 2 / 0 | 8,978 | 106 | 56.08 | **112.16** |
+| 4 | 4 | 4 / 0 | 19,576 | 146 | 49.59 | **198.38** |
+| 6 | 6 | 6 / 0 | 13,530 | 127 | 40.29 | **241.75** |
+
+- **Aggregate throughput rises with concurrency**: 73.05 → 112.16 → 198.38 → 241.75 tok/s
+  (**1.53× / 2.72× / 3.31×** over a single stream).
+- **Per-stream speed decays**: 73.05 → 40.29 tok/s; at C=6 it is 55% of the single-stream rate
+  (batch-internal competition of MTP speculative decoding plus KV bandwidth).
+- **4 → 6 tapers off**: +21.9%, versus +76.8% for 2 → 4. With `--max-num-seqs 8`, 6 → 8 should
+  taper further.
+- **Stability**: 24/24 requests succeeded — no timeouts, no OOM.
+- Caveat: questions are random, so per-level token totals are not comparable. Read the
+  per-stream vs aggregate **trend**, not `total tokens ÷ session time` (prefill-polluted).
 
 ## Key vLLM Parameters
 
@@ -331,6 +357,7 @@ qwen3.8-flash-next-nvfp4-tp2/
 ├── stop-official.sh       # 停止双机容器
 ├── files/                 # 容器内即时生效的补丁与工具（无需重建镜像）
 ├── bench/                 # 压测 / 上下文 / MTP 接受率 / 推理抽检
+├── results/               # 压测结果快照（Markdown）
 ├── docs/                  # 设计与移交笔记
 └── tp1/                   # 单卡自包含子目录
 ```
@@ -430,6 +457,29 @@ docker logs vllm-fn 2>&1 | grep -E "rank .* nranks"     # 预期 rank 0/1，nran
 | 敏感度 | +0.01 GMU ≈ +0.83 GiB ≈ +95k fp8 cache token |
 | MTP | `MTP_NUM_SPECULATIVE_TOKENS=3` |
 | 推理 / needle 回归（fp8 KV） | 均 12/12 |
+
+### Benchmark：并发梯度压测（实测）
+
+原始数据见 [`results/RESULTS-2026-09-21-concurrency.md`](results/RESULTS-2026-09-21-concurrency.md)。
+
+**2026-09-21** 在运行中的实例上实测（fp8 KV、MTP=3、`--max-num-seqs 8`），每档 1 轮：
+每档启动 `concurrency` 个 worker，各发 **1 个随机问题**（SSE 流式）：
+
+| 并发 | 请求数 | 成功 / 失败 | 总 tokens | 会话耗时 (s) | 单流速度 (tok/s) | 合计吞吐 (tok/s) |
+|---|---|---|---|---|---|---|
+| 1 | 1 | 1 / 0 | 3,164 | 46 | 73.05 | **73.05** |
+| 2 | 2 | 2 / 0 | 8,978 | 106 | 56.08 | **112.16** |
+| 4 | 4 | 4 / 0 | 19,576 | 146 | 49.59 | **198.38** |
+| 6 | 6 | 6 / 0 | 13,530 | 127 | 40.29 | **241.75** |
+
+- **聚合吞吐随并发单调上升**：73.05 → 112.16 → 198.38 → 241.75 tok/s，较单流提升
+  **1.53× / 2.72× / 3.31×**。
+- **单流速度随并发衰减**：73.05 → 40.29 tok/s，6 并发时为单流的 55%（MTP 投机解码的批内
+  竞争 + KV 带宽）。
+- **4 → 6 收益收窄**：+21.9%，低于 2 → 4 的 +76.8%；在 `--max-num-seqs 8` 下 6 → 8 预计继续收窄。
+- **稳定性**：24 个请求全部成功，无超时、无 OOM。
+- 口径说明：每档使用随机问题，各组生成长度不可比，应看「单流 vs 合计吞吐」随并发的
+  **趋势**，不宜用 `总 tokens ÷ 会话耗时` 反算吞吐（含 prefill 时间，会被污染）。
 
 ## vLLM 关键参数
 
